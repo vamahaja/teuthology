@@ -1,0 +1,78 @@
+# Environment-specific settings. Copy or edit before deploy.
+#
+# App images default to quay.io/ceph-infra. Override any *.image to use a
+# different registry, tag, or locally built image, e.g.:
+#   paddles.image: my.registry/paddles:dev
+#   --set dispatcher.image=quay.io/ceph-infra/teuthology-dev:main
+
+postgres:
+  image: quay.io/ceph-infra/teuthology-postgresql:latest
+  password: secret
+  storage: 100Gi
+
+paddles:
+  image: quay.io/ceph-infra/paddles:latest
+  # Nodes often report hundreds of CPUs; paddles gunicorn uses this count.
+  workerCount: "4"
+  # Update after deploy to the archive Route URL, e.g.:
+  # http://archive-<namespace>.apps.example.com/{run_name}/{job_id}/teuthology.log
+  jobLogHrefTempl: http://archive/{run_name}/{job_id}/teuthology.log
+
+pulpito:
+  image: quay.io/ceph-infra/pulpito:latest
+
+beanstalk:
+  image: quay.io/ceph-infra/teuthology-beanstalkd:latest
+  # LoadBalancer so workstations can set queue_host to the EXTERNAL-IP.
+  # Use ClusterIP if only in-cluster clients need the queue.
+  serviceType: LoadBalancer
+
+# Shared job archive (httpd) and teuthology-dispatcher. Both pods mount
+# the same PVC; accessMode must be ReadWriteMany unless you co-locate them.
+archive:
+  image: httpd:2.4
+  storage: 100Gi
+  accessMode: ReadWriteMany
+  # Set if your cluster needs an explicit RWX storage class:
+  # storageClassName: ""
+
+dispatcher:
+  image: quay.io/ceph-infra/teuthology-dev:main
+  tube: ocpvirt
+  labDomain: ocpvirt.local
+
+# Namespace-scoped Layer2 UDN (IPAM Disabled). Guests get addressing from
+# the dhcp-gateway VirtualMachine (dnsmasq + NAT), not from OVN.
+udn:
+  name: teuthology-net
+  subnet: 192.168.0.0/20
+  gateway: 192.168.0.8
+  prefix: 20
+  netmask: 255.255.240.0
+  dhcpRangeStart: 192.168.14.10
+  dhcpRangeEnd: 192.168.15.253
+
+# Dual-NIC VirtualMachinePool (replicas=1): masquerade + UDN. No privileged SCC.
+# Deleting the VM/VMI is healed by the pool / runStrategy: Always.
+dhcpGateway:
+  name: dhcp-gateway
+  replicas: 1
+  cores: 1
+  memory: 2Gi
+  rootDiskSize: 20Gi
+  accessMode: ReadWriteMany
+  storageClassName: rh-restricted-nfs
+  dataSource:
+    name: fedora
+    namespace: openshift-virtualization-os-images
+  # Fixed MAC on the UDN NIC (must match cloud-init gateway script).
+  mac: "52:54:00:d4:c9:08"
+  sshUser: teuthology
+  password: passwd
+  sshAuthorizedKeys: []
+  # Override at deploy time, e.g.:
+  #   --set dhcpGateway.sshUser=teuthology --set dhcpGateway.password=secret
+  # Static leases (laptop front.xml). Format: dhcp-host=<mac>,<ip>,<hostname>
+  dhcpHosts: |
+    # dhcp-host=52:54:00:00:00:00,192.168.14.10,target-00
+    # dhcp-host=52:54:00:00:00:01,192.168.14.11,target-01
