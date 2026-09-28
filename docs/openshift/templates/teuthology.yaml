@@ -1,0 +1,335 @@
+{{- /*
+  Dual-NIC KubeVirt VM for running teuthology CLI on the UDN.
+  Masquerade reaches paddles/beanstalk; UDN DHCP/DNS reaches target-*.<labDomain>.
+  Fedora DataSource (same as dhcp-gateway) — teuthology-dev is a container image, not a VM disk.
+*/ -}}
+{{- if .Values.teuthology.enabled | default true }}
+{{- $vmName := .Values.teuthology.name | default "teuthology" }}
+{{- $sshUser := .Values.teuthology.sshUser | default "teuthology" }}
+{{- $ns := .Release.Namespace }}
+{{- $domain := .Values.dispatcher.labDomain }}
+{{- $ocp := .Values.openshift | default dict }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $vmName }}-cloudinit
+  labels:
+    app: teuthology
+type: Opaque
+stringData:
+  userdata: |
+    #cloud-config
+    hostname: {{ $vmName }}
+    manage_etc_hosts: true
+    disable_root: false
+    ssh_pwauth: true
+    users:
+      - name: {{ $sshUser | quote }}
+        sudo: ALL=(root) NOPASSWD:ALL
+        shell: /bin/bash
+        lock_passwd: false
+        plain_text_passwd: {{ .Values.teuthology.password | default "passwd" | quote }}
+        ssh_authorized_keys:
+{{- range .Values.teuthology.sshAuthorizedKeys }}
+          - {{ . | quote }}
+{{- end }}
+    chpasswd:
+      expire: false
+      users:
+        - name: {{ $sshUser | quote }}
+          password: {{ .Values.teuthology.password | default "passwd" | quote }}
+          type: text
+        - name: root
+          password: {{ .Values.teuthology.password | default "passwd" | quote }}
+          type: text
+    write_files:
+      - path: /etc/teuthology.yaml
+        permissions: "0644"
+        content: |
+          queue_host: beanstalk.{{ $ns }}.svc.cluster.local
+          queue_port: 11300
+          lock_server: http://paddles.{{ $ns }}.svc.cluster.local:8080
+          results_server: http://paddles.{{ $ns }}.svc.cluster.local:8080
+          results_ui_server: http://pulpito.{{ $ns }}.svc.cluster.local:8081/
+          lab_domain: {{ $domain | quote }}
+          archive_base: /home/{{ $sshUser }}/archive
+          reserve_machines: 0
+          ssh_key: /home/{{ $sshUser }}/.ssh/id_ed25519
+          openshift:
+            namespace: {{ $ns }}
+            machine_types: ['{{ .Values.dispatcher.tube }}']
+            user_data: teuthology/ocp/user_data/ocp-{os_type}-{os_version}-user-data.txt
+            udn_name: {{ .Values.udn.name | quote }}
+            udn_binding: {{ $ocp.udn_binding | default "l2bridge" | quote }}
+            vcpus: {{ $ocp.vcpus | default 4 }}
+            ram: {{ $ocp.ram | default "8Gi" | quote }}
+            root_storage_size: {{ $ocp.root_storage_size | default "40Gi" | quote }}
+{{- if $ocp.root_storage_class }}
+            root_storage_class: {{ $ocp.root_storage_class | quote }}
+{{- end }}
+{{- if $ocp.data_storage_class }}
+            data_storage_class: {{ $ocp.data_storage_class | quote }}
+{{- end }}
+{{- if $ocp.datasource_namespace }}
+            datasource_namespace: {{ $ocp.datasource_namespace | quote }}
+{{- end }}
+{{- if $ocp.server }}
+            server: {{ $ocp.server | quote }}
+{{- end }}
+{{- if $ocp.token }}
+            token: {{ $ocp.token | quote }}
+{{- end }}
+{{- if $ocp.certificate_authority_data }}
+            certificate_authority_data: {{ $ocp.certificate_authority_data | quote }}
+{{- end }}
+      - path: /usr/local/sbin/teuthology-udn-client.sh
+        permissions: "0755"
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+          UDN_MAC="{{ .Values.teuthology.mac }}"
+          UDN_MAC="$(printf '%s' "$UDN_MAC" | tr '[:upper:]' '[:lower:]')"
+          GW="{{ .Values.udn.gateway }}"
+          DOMAIN="{{ $domain }}"
+          CON_NAME="teuthology-udn"
+          USER_NAME="{{ $sshUser }}"
+
+          UDN_IFACE=""
+          for d in /sys/class/net/*; do
+            n="$(basename "$d")"
+            [[ "$n" = lo ]] && continue
+            a="$(cat "$d/address" 2>/dev/null || true)"
+            if [[ "$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')" = "$UDN_MAC" ]]; then
+              UDN_IFACE="$n"
+              break
+            fi
+          done
+          if [[ -z "$UDN_IFACE" ]]; then
+            echo "no NIC with MAC $UDN_MAC" >&2
+            ip link >&2
+            exit 1
+          fi
+
+          MASQ_IFACE="$(ip -4 route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+          echo "UDN iface=$UDN_IFACE masq=${MASQ_IFACE:-none} gw=$GW domain=$DOMAIN"
+
+          if command -v nmcli >/dev/null 2>&1; then
+            if nmcli -g NAME con show | grep -qx "$CON_NAME"; then
+              nmcli con modify "$CON_NAME" \
+                connection.interface-name "$UDN_IFACE" \
+                ipv4.method auto \
+                ipv4.never-default yes \
+                ipv4.route-metric 200 \
+                connection.autoconnect yes
+            else
+              nmcli con add type ethernet ifname "$UDN_IFACE" con-name "$CON_NAME" \
+                ipv4.method auto ipv4.never-default yes ipv4.route-metric 200 \
+                connection.autoconnect yes
+            fi
+            nmcli con up "$CON_NAME" || true
+          else
+            ip link set "$UDN_IFACE" up
+            command -v dhclient >/dev/null 2>&1 && dhclient -1 "$UDN_IFACE" || true
+          fi
+
+          if command -v resolvectl >/dev/null 2>&1; then
+            resolvectl dns "$UDN_IFACE" "$GW" || true
+            resolvectl domain "$UDN_IFACE" "~${DOMAIN}" "${DOMAIN}" || true
+          fi
+          mkdir -p /etc/systemd/resolved.conf.d
+          cat > /etc/systemd/resolved.conf.d/teuthology-udn.conf <<EOF
+          [Resolve]
+          DNS=${GW}
+          Domains=~${DOMAIN} ${DOMAIN}
+          EOF
+          systemctl try-reload-or-restart systemd-resolved >/dev/null 2>&1 || true
+
+          install -d -m 0755 -o "$USER_NAME" -g "$USER_NAME" "/home/${USER_NAME}/archive"
+          install -d -m 0700 -o "$USER_NAME" -g "$USER_NAME" "/home/${USER_NAME}/.ssh"
+          if [[ ! -f /home/${USER_NAME}/.ssh/id_ed25519 ]]; then
+            sudo -u "$USER_NAME" ssh-keygen -t ed25519 -N '' -f "/home/${USER_NAME}/.ssh/id_ed25519"
+          fi
+          cp -a /etc/teuthology.yaml "/home/${USER_NAME}/.teuthology.yaml"
+          chown "${USER_NAME}:${USER_NAME}" "/home/${USER_NAME}/.teuthology.yaml"
+          grep -q '/opt/teuthology/.venv/bin' "/home/${USER_NAME}/.bashrc" 2>/dev/null || \
+            echo 'export PATH="$PATH:/opt/teuthology/.venv/bin"' >> "/home/${USER_NAME}/.bashrc"
+          chown "${USER_NAME}:${USER_NAME}" "/home/${USER_NAME}/.bashrc"
+      - path: /usr/local/sbin/teuthology-bootstrap.sh
+        permissions: "0755"
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+          {{- if not (.Values.teuthology.install | default true) }}
+          echo "teuthology.install=false; skip clone/bootstrap"
+          exit 0
+          {{- end }}
+          GIT_URL="{{ .Values.teuthology.gitUrl | default "https://github.com/ceph/teuthology.git" }}"
+          GIT_BRANCH="{{ .Values.teuthology.gitBranch | default "main" }}"
+          DEST=/opt/teuthology
+          if [[ -x ${DEST}/.venv/bin/teuthology-lock ]]; then
+            echo "teuthology already installed in $DEST"
+            exit 0
+          fi
+          # Metalink mirrors often hang in-cluster; use dl.fedoraproject.org.
+          for f in /etc/yum.repos.d/fedora.repo /etc/yum.repos.d/fedora-updates.repo; do
+            [[ -f "$f" ]] || continue
+            sed -i \
+              -e 's|^metalink=|#metalink=|' \
+              -e 's|^#baseurl=http://download.example/pub/fedora/linux/|baseurl=https://dl.fedoraproject.org/pub/fedora/linux/|' \
+              "$f"
+          done
+          if [[ -f /etc/yum.repos.d/fedora-cisco-openh264.repo ]]; then
+            sed -i 's/^enabled=1/enabled=0/' /etc/yum.repos.d/fedora-cisco-openh264.repo || true
+          fi
+          dnf -y --setopt=max_parallel_downloads=1 install git python3 python3-pip python3-devel gcc libffi-devel openssl-devel libyaml-devel libev-devel libvirt-devel pipx jq curl
+          mkdir -p "$(dirname "$DEST")"
+          if [[ ! -d $DEST/.git ]]; then
+            git clone --depth 1 --branch "$GIT_BRANCH" "$GIT_URL" "$DEST"
+          else
+            git -C "$DEST" fetch origin "$GIT_BRANCH" && git -C "$DEST" checkout "$GIT_BRANCH"
+          fi
+          cd "$DEST"
+          chmod +x ./bootstrap
+          export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_TEUTHOLOGY="${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_TEUTHOLOGY:-0.0.0}"
+          ./bootstrap install
+          # OpenShift provisioner (kubernetes Python client)
+          uv pip install kubernetes || true
+      - path: /etc/systemd/system/teuthology-udn-client.service
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Teuthology UDN client (DHCP + split DNS)
+          After=network-online.target NetworkManager-wait-online.service
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/teuthology-udn-client.sh
+          RemainAfterExit=yes
+          [Install]
+          WantedBy=multi-user.target
+      - path: /etc/systemd/system/teuthology-bootstrap.service
+        permissions: "0644"
+        content: |
+          [Unit]
+          Description=Clone and bootstrap teuthology
+          After=network-online.target teuthology-udn-client.service
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/teuthology-bootstrap.sh
+          RemainAfterExit=yes
+          TimeoutStartSec=1h
+          [Install]
+          WantedBy=multi-user.target
+    package_update: false
+    package_upgrade: false
+    runcmd:
+      - timedatectl set-timezone Etc/UTC || true
+      - systemctl daemon-reload
+      - systemctl enable --now teuthology-udn-client.service
+      - systemctl enable --now teuthology-bootstrap.service
+    final_message: "teuthology CLI VM ready (UDN client; bootstrap may still be running)"
+---
+apiVersion: pool.kubevirt.io/v1alpha1
+kind: VirtualMachinePool
+metadata:
+  name: {{ $vmName }}
+  labels:
+    app: teuthology
+spec:
+  replicas: {{ .Values.teuthology.replicas | default 1 }}
+  selector:
+    matchLabels:
+      app: teuthology
+  virtualMachineTemplate:
+    metadata:
+      labels:
+        app: teuthology
+    spec:
+      runStrategy: Always
+      dataVolumeTemplates:
+        - metadata:
+            name: {{ $vmName }}-root
+          spec:
+            sourceRef:
+              kind: DataSource
+              name: {{ .Values.teuthology.dataSource.name | default .Values.dhcpGateway.dataSource.name | default "fedora" }}
+              {{- $dsNs := .Values.teuthology.dataSource.namespace | default .Values.dhcpGateway.dataSource.namespace }}
+              {{- if $dsNs }}
+              namespace: {{ $dsNs }}
+              {{- end }}
+            storage:
+              accessModes:
+                - {{ .Values.teuthology.accessMode | default .Values.dhcpGateway.accessMode | default "ReadWriteMany" }}
+              volumeMode: Filesystem
+              {{- $sc := .Values.teuthology.storageClassName | default .Values.dhcpGateway.storageClassName }}
+              {{- if $sc }}
+              storageClassName: {{ $sc }}
+              {{- end }}
+              resources:
+                requests:
+                  storage: {{ .Values.teuthology.rootDiskSize | default "40Gi" }}
+      template:
+        metadata:
+          labels:
+            app: teuthology
+        spec:
+          domain:
+            cpu:
+              cores: {{ .Values.teuthology.cores | default 4 }}
+            memory:
+              guest: {{ .Values.teuthology.memory | default "8Gi" | quote }}
+            resources:
+              requests:
+                cpu: {{ .Values.teuthology.cores | default 4 | quote }}
+                memory: {{ .Values.teuthology.memory | default "8Gi" | quote }}
+              limits:
+                cpu: {{ .Values.teuthology.cores | default 4 | quote }}
+                memory: {{ .Values.teuthology.memory | default "8Gi" | quote }}
+            devices:
+              disks:
+                - name: rootdisk
+                  bootOrder: 1
+                  disk:
+                    bus: virtio
+                - name: cloudinitdisk
+                  disk:
+                    bus: virtio
+              interfaces:
+                - name: default
+                  masquerade: {}
+                - name: {{ .Values.udn.name }}
+                  macAddress: {{ .Values.teuthology.mac | quote }}
+                  binding:
+                    name: l2bridge
+          networks:
+            - name: default
+              pod: {}
+            - name: {{ .Values.udn.name }}
+              multus:
+                networkName: {{ .Values.udn.name }}
+          volumes:
+            - name: cloudinitdisk
+              cloudInitNoCloud:
+                secretRef:
+                  name: {{ $vmName }}-cloudinit
+            - name: rootdisk
+              dataVolume:
+                name: {{ $vmName }}-root
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $vmName }}
+  labels:
+    app: teuthology
+spec:
+  type: LoadBalancer
+  selector:
+    app: teuthology
+  ports:
+    - name: ssh
+      protocol: TCP
+      port: 22
+      targetPort: 22
+{{- end }}

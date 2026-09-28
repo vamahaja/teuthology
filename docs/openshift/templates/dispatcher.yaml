@@ -1,0 +1,116 @@
+{{- $ocp := .Values.openshift | default dict }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: teuthology-config
+  labels:
+    app: dispatcher
+data:
+  teuthology.yaml: |
+    queue_host: beanstalk
+    queue_port: 11300
+    lock_server: http://paddles:8080
+    results_server: http://paddles:8080
+    results_ui_server: http://pulpito:8081/
+    teuthology_path: /teuthology
+    archive_base: /archive
+    reserve_machines: 0
+    lab_domain: {{ .Values.dispatcher.labDomain | quote }}
+    openshift:
+      namespace: {{ .Release.Namespace }}
+      machine_types: ['{{ .Values.dispatcher.tube }}']
+      user_data: teuthology/ocp/user_data/ocp-{os_type}-{os_version}-user-data.txt
+      udn_name: {{ .Values.udn.name | quote }}
+      udn_binding: {{ $ocp.udn_binding | default "l2bridge" | quote }}
+      vcpus: {{ $ocp.vcpus | default 4 }}
+      ram: {{ $ocp.ram | default "8Gi" | quote }}
+      root_storage_size: {{ $ocp.root_storage_size | default "40Gi" | quote }}
+{{- if $ocp.root_storage_class }}
+      root_storage_class: {{ $ocp.root_storage_class | quote }}
+{{- end }}
+{{- if $ocp.data_storage_class }}
+      data_storage_class: {{ $ocp.data_storage_class | quote }}
+{{- end }}
+{{- if $ocp.datasource_namespace }}
+      datasource_namespace: {{ $ocp.datasource_namespace | quote }}
+{{- end }}
+{{- if $ocp.server }}
+      server: {{ $ocp.server | quote }}
+{{- end }}
+{{- if $ocp.token }}
+      token: {{ $ocp.token | quote }}
+{{- end }}
+{{- if $ocp.certificate_authority_data }}
+      certificate_authority_data: {{ $ocp.certificate_authority_data | quote }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dispatcher
+  labels:
+    app: dispatcher
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: dispatcher
+  template:
+    metadata:
+      labels:
+        app: dispatcher
+    spec:
+      initContainers:
+        - name: wait-for-beanstalk
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z beanstalk 11300; do
+                echo "waiting for beanstalk..."
+                sleep 2
+              done
+        - name: wait-for-paddles
+          image: curlimages/curl
+          command:
+            - sh
+            - -c
+            - |
+              until curl -sf http://paddles:8080; do
+                echo "waiting for paddles..."
+                sleep 2
+              done
+      containers:
+        - name: dispatcher
+          image: {{ .Values.dispatcher.image }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              export PATH="$PATH:/teuthology/.venv/bin"
+              mkdir -p /var/log/teuthology
+              exec teuthology-dispatcher -v \
+                --archive-dir /archive \
+                --tube {{ .Values.dispatcher.tube }} \
+                --log-dir /var/log/teuthology
+          volumeMounts:
+            - name: archive
+              mountPath: /archive
+            - name: config
+              mountPath: /etc/teuthology.yaml
+              subPath: teuthology.yaml
+            - name: logs
+              mountPath: /var/log/teuthology
+      volumes:
+        - name: archive
+          persistentVolumeClaim:
+            claimName: teuthology-archive
+        - name: config
+          configMap:
+            name: teuthology-config
+        - name: logs
+          emptyDir: {}
