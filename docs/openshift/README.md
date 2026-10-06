@@ -1,325 +1,122 @@
-# OpenShift Teuthology Services
+# OpenShift teuthology
 
-Deploy paddles, pulpito, beanstalkd, the job archive (httpd), teuthology-dispatcher, a teuthology CLI VirtualMachine, PostgreSQL, a namespace-scoped UserDefinedNetwork, and a DHCP/NAT gateway VirtualMachine on OpenShift using a Helm chart under `docs/openshift/`. Environment-specific settings live in `values.yaml`.
+The Helm chart in `docs/openshift/` deploys paddles, pulpito, beanstalkd, the job archive, teuthology-dispatcher, PostgreSQL, a namespace-scoped UserDefinedNetwork, a dhcp-gateway VirtualMachine, and a teuthology CLI VirtualMachine. Change cluster-specific settings in `values.yaml` before you install.
 
-| Component | Kind | Notes |
-|-----------|------|--------|
-| paddles / pulpito / beanstalk / archive / dispatcher / postgres | Deployment + Service | App images from quay.io/ceph-infra by default |
-| teuthology | VirtualMachinePool (replicas=1) | Dual-NIC CLI VM on UDN; Fedora DataSource |
-| paddles, pulpito, archive | Route | HTTP only unless you add TLS |
-| teuthology-net | UserDefinedNetwork | Namespace-scoped; IPAM Disabled |
-| dhcp-gateway | VirtualMachinePool (replicas=1) | Dual-NIC VM; DHCP/DNS/NAT in guest |
-| allow-openshift-ingress | NetworkPolicy | Lets the OpenShift router reach app pods |
+This chart does not create test machines. `teuthology-lock` and reimage create and delete those VirtualMachines through the OpenShift provisioner.
+
+| Component | Kind | Role |
+|-----------|------|------|
+| paddles, pulpito, beanstalk, archive, dispatcher, postgres | Deployment and Service | Lab services. Images default to quay.io/ceph-infra. |
+| paddles, pulpito, archive | Route | HTTP unless you add TLS |
+| `udn.name` | UserDefinedNetwork | Layer2 overlay with IPAM disabled |
+| dhcp-gateway | VirtualMachinePool (replicas=1) | Dual-NIC guest that runs DHCP, DNS, and NAT |
+| teuthology | VirtualMachinePool (replicas=1) | Dual-NIC CLI host for lock and SSH to targets |
+| allow-openshift-ingress | NetworkPolicy | Lets the OpenShift router reach application pods |
+
+Set these variables so later commands match `values.yaml`:
+
+```bash
+export NAMESPACE=teuthology
+export LAB_DOMAIN=ocpvirt.local          # dispatcher.labDomain
+export MACHINE_TYPE=ocpvirt              # dispatcher.tube
+export UDN_NAME=teuthology-net           # udn.name
+export SA=teuthology-provisioner
+```
 
 ## Architecture
 
+The pod network carries HTTP, PostgreSQL, and the beanstalk queue. The UserDefinedNetwork is a private Layer2 overlay for guest addressing. The dhcp-gateway VirtualMachine is the only DHCP, DNS, and NAT server on that overlay. The teuthology CLI VM sits on both networks: it talks to paddles and beanstalk on the pod network, and it reaches `target-*.<lab_domain>` on the UDN through dynamic DNS. Workstations usually cannot route to `udn.gateway`, so run lock and SSH to targets from the CLI VM.
+
 ```mermaid
 flowchart TB
-  subgraph Clients["Clients / workstation"]
+  subgraph Clients["Clients"]
     Browser["Browser"]
-    SshCli["SSH to teuthology VM"]
+    SshCli["SSH to teuthology CLI VM"]
   end
 
-  Router["OpenShift Router<br/>Routes: paddles, pulpito, archive"]
+  Router["OpenShift Router<br/>paddles · pulpito · archive"]
 
-  subgraph NS["Namespace $NAMESPACE"]
-    subgraph Apps["Teuthology services"]
-      Pulpito["pulpito :8081"]
-      Paddles["paddles :8080"]
-      PG["paddles-postgres"]
-      Beanstalk["beanstalkd :11300"]
-      Dispatcher["teuthology-dispatcher"]
-      Archive["archive httpd<br/>shared RWX PVC"]
+  subgraph NS["Namespace"]
+    subgraph Apps["Pod network"]
+      Pulpito["pulpito"]
+      Paddles["paddles"]
+      PG["postgres"]
+      Beanstalk["beanstalkd"]
+      Dispatcher["dispatcher"]
+      Archive["archive"]
     end
 
-    NP["NetworkPolicy<br/>allow-openshift-ingress"]
-
-    subgraph UDN["UserDefinedNetwork (udn.name)<br/>Layer2 · IPAM Disabled"]
-      GW["dhcp-gateway VM<br/>udn.gateway · dnsmasq + NAT"]
-      TeuthVM["teuthology CLI VM<br/>teuthology.ip"]
-      TestVMs["Test VMs on UDN<br/>DHCP hostname target-*"]
+    subgraph UDN["UserDefinedNetwork · Layer2 · IPAM disabled"]
+      GW["dhcp-gateway VM"]
+      TeuthVM["teuthology CLI VM"]
+      TestVMs["test VMs target-*"]
     end
   end
 
   Browser --> Router
-  Router -->|"HTTP"| Pulpito
+  Router --> Pulpito
   Router --> Paddles
   Router --> Archive
-  NP -.-> Router
-
-  SshCli -->|"SSH :22"| TeuthVM
-
+  SshCli --> TeuthVM
   Pulpito --> Paddles
   Paddles --> PG
   Dispatcher --> Beanstalk
   Dispatcher --> Paddles
   Dispatcher --> Archive
-  TeuthVM -->|"lock / results"| Paddles
-  TeuthVM -->|"queue"| Beanstalk
-  TeuthVM -->|"SSH ubuntu@target-*.lab_domain"| TestVMs
+  TeuthVM --> Paddles
+  TeuthVM --> Beanstalk
+  TeuthVM -->|"ubuntu@target-*.lab_domain"| TestVMs
+  GW -->|"DHCP DNS NAT"| TeuthVM
+  GW -->|"DHCP DNS NAT"| TestVMs
 
-  GW -->|"masquerade NIC"| Egress["Cluster egress / CDN"]
-  GW -->|"DHCP DNS NAT on UDN NIC"| TeuthVM
-  GW -->|"DHCP DNS NAT on UDN NIC"| TestVMs
-  TeuthVM -.->|"Multus teuthology-net"| UDN
-  TestVMs -.->|"Multus teuthology-net"| UDN
+  classDef clients fill:#E3F2FD,stroke:#1565C0,color:#0D47A1
+  classDef apps fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+  classDef udn fill:#FFF8E1,stroke:#F9A825,color:#F57F17
+  classDef gw fill:#F3E5F5,stroke:#7B1FA2,color:#4A148C
+  classDef router fill:#ECEFF1,stroke:#546E7A,color:#37474F
+
+  class Browser,SshCli clients
+  class Pulpito,Paddles,PG,Beanstalk,Dispatcher,Archive apps
+  class TeuthVM,TestVMs udn
+  class GW gw
+  class Router router
 ```
-
-Pod network carries app traffic (Services / Routes). The UDN is a private L2 overlay for guest addressing; the dhcp-gateway VM is the only DHCP/DNS/NAT server on that network (namespace-scoped). The **teuthology CLI VM** is dual-NIC (masquerade + UDN): it talks to paddles/beanstalk over the pod network and to `target-*.<lab_domain>` over the UDN using dhcp-gateway **dynamic** DNS. Test VMs are reachable from that CLI VM when the OpenShift provisioner attaches the UDN (`udn.name` / `openshift.udn_name`) with the paddles MAC on that NIC and the guest DHCP client registers the paddles **shortname**. Lock does not pin a stable IP; dnsmasq maps the current lease to `target-00.<lab_domain>`. If `openshift.udn_name` is empty, the guest stays on masquerade and will not appear in UDN DNS. Chart defaults for subnet, gateway, lab domain, and machine type are in `values.yaml`; override them for your cluster.
-
-## Prerequisites
-
-* An OpenShift cluster with `oc` and `helm` configured, OVN-Kubernetes, and Multus
-* OpenShift Virtualization installed, with OS DataSources available (set `*.dataSource.namespace` to `<datasource-namespace>` if they are not in the chart namespace; chart default name is `fedora`)
-* Cluster nodes must be able to pull from [quay.io/ceph-infra](https://quay.io/organization/ceph-infra) (and Docker Hub for `httpd`, `busybox`, `curlimages/curl`, unless you override those images). For private quay repos, configure `imagePullSecrets` on the deployments or link a puller SA to the project
-* A `ReadWriteMany` storage class for the shared archive PVC and the dhcp-gateway / teuthology **CLI** VM disks (`archive.storageClassName`, `dhcpGateway.storageClassName`, `teuthology.storageClassName`). Guest test VMs use a **separate** pair in `openshift.root_storage_class` (OS disk) and `openshift.data_storage_class` (extra volumes from user-data); they may be the same class or different ones. The OpenShift provisioner requires both guest classes in `~/.teuthology.yaml` / Helm `openshift.*`
-* Permission to create `VirtualMachinePool` / `VirtualMachine` / `DataVolume` / `NetworkPolicy` in the namespace (no privileged SCC — DHCP runs inside the dhcp-gateway guest)
-* A load balancer (MetalLB or equivalent) for EXTERNAL-IP on Services `dhcp-gateway` and `teuthology` (SSH port 22). Guest DNS stays on the UDN NIC
-* Run `teuthology-lock` from the **teuthology VM** (SSH to its LoadBalancer IP). A workstation does not need a UDN route if you do that
-
-## Recommended order
-
-1. Export namespace and install the chart (creates UDN, apps, NetworkPolicy, dhcp-gateway VM, teuthology CLI VM)
-2. Wait for core Deployments and both VMs Ready (cloud-init may take several minutes after Ready; teuthology bootstrap can take longer)
-3. Set `paddles.jobLogHrefTempl` from the archive Route and upgrade
-4. Seed paddles nodes as **FQDNs** (`target-00.<lab_domain>`) **with a unique `mac_address` per node**. The OpenShift provisioner stamps that MAC on the UDN NIC. Do **not** put `target-*` in `dhcpGateway.dhcpHosts` (IPs stay dynamic). Keep a static lease only for the teuthology CLI VM
-5. Confirm paddles knows the FQDN (see commands below)
-6. Put lab SSH **public** keys in `teuthology/ocp/user_data/` (not the locker’s `~/.ssh` at runtime). Set `openshift.root_storage_class` / `data_storage_class` in values or `~/.teuthology.yaml`
-7. Create a ServiceAccount and put its token (and CA if required) in teuthology.yaml ([Service account](#service-account-for-the-openshift-provisioner))
-8. SSH to the teuthology VM and run lock/reimage there (`target-*.<lab_domain>` comes from DHCP hostname + dnsmasq)
-
-### Environment variables
-
-Set these once; they must match `values.yaml` (`dispatcher.labDomain`, `dispatcher.tube`, `udn.name`):
-
-```bash
-export NAMESPACE=teuthology
-export LAB_DOMAIN=ocpvirt.local
-export MACHINE_TYPE=ocpvirt
-export UDN_NAME=teuthology-net
-export SA=teuthology-provisioner
-```
-
-Replace the values with your namespace, DNS domain, paddles `machine_type` / dispatcher tube, UDN name, and ServiceAccount name. The examples match chart defaults in `values.yaml`. Later commands use these variables.
-
-## Configure values.yaml
-
-Edit `docs/openshift/values.yaml` for your cluster. Change `postgres.password`, `dispatcher.labDomain`, `dispatcher.tube`, UDN addressing, storage classes, and images as needed. The snippet below is the chart defaults, not a lab-specific overlay.
-
-App images default to [quay.io/ceph-infra](https://quay.io/organization/ceph-infra). Override any `*.image` to use another registry, tag, or a locally built image.
-
-```yaml
-postgres:
-  image: quay.io/ceph-infra/teuthology-postgresql:latest
-  password: secret
-  storage: 100Gi
-
-paddles:
-  image: quay.io/ceph-infra/paddles:latest
-  workerCount: "4"
-  # Required after first deploy — replace with the archive Route host (see Deploy)
-  jobLogHrefTempl: http://archive/{run_name}/{job_id}/teuthology.log
-
-pulpito:
-  image: quay.io/ceph-infra/pulpito:latest
-
-beanstalk:
-  image: quay.io/ceph-infra/teuthology-beanstalkd:latest
-  serviceType: LoadBalancer
-
-archive:
-  image: httpd:2.4
-  storage: 100Gi
-  accessMode: ReadWriteMany
-  # storageClassName: <rwx-storage-class>
-
-dispatcher:
-  image: quay.io/ceph-infra/teuthology-dev:main
-  tube: ocpvirt
-  labDomain: ocpvirt.local
-
-teuthology:
-  enabled: true
-  mac: "52:54:00:d4:c9:09"
-  ip: 192.168.14.9
-  sshUser: teuthology
-  password: passwd
-  gitUrl: https://github.com/ceph/teuthology.git
-  gitBranch: main
-
-# Guest VMs created by teuthology-lock (not Helm infra disks).
-openshift:
-  vcpus: 4
-  ram: 8Gi
-  root_storage_size: 40Gi
-  # root_storage_class: <rwx-storage-class>
-  # data_storage_class: <rwx-storage-class>
-
-udn:
-  name: teuthology-net
-  subnet: 192.168.0.0/20
-  gateway: 192.168.0.8
-  prefix: 20
-  netmask: 255.255.240.0
-  dhcpRangeStart: 192.168.14.10
-  dhcpRangeEnd: 192.168.15.253
-
-dhcpGateway:
-  replicas: 1
-  # storageClassName: <rwx-storage-class>
-  mac: "52:54:00:d4:c9:08"
-  sshUser: teuthology
-  password: passwd
-  sshAuthorizedKeys:
-    - ssh-ed25519 AAAA... your-key
-  dhcpHosts: |
-    dhcp-host=52:54:00:d4:c9:09,192.168.14.9,teuthology
-```
-
-Do not put paddles `target-*` inventory in `values.yaml` or `dhcpGateway.dhcpHosts`. Register node **names** in paddles; UDN addresses are assigned at lock time (see below).
-
-Examples of image overrides:
-
-```bash
-# Pin a tag
---set pulpito.image=quay.io/ceph-infra/pulpito:main
-
-# Use a private or in-cluster build
---set dispatcher.image=image-registry.openshift-image-registry.svc:5000/$NAMESPACE/teuthology:latest
-```
-
-## Optional: build custom images
-
-Only needed if you override the quay.io/ceph-infra defaults. Examples use `podman`.
-
-Clone and build paddles and pulpito:
-
-```bash
-git clone https://github.com/ceph/paddles.git
-cd paddles && podman build . --file Dockerfile --tag paddles
-
-git clone https://github.com/ceph/pulpito.git
-cd pulpito && podman build . --file Dockerfile --tag pulpito
-```
-
-Build beanstalkd from this repository:
-
-```bash
-cd beanstalk/alpine && podman build . --file Dockerfile --tag beanstalkd
-```
-
-Build the teuthology (dispatcher) image from this repository:
-
-```bash
-podman build -f docs/docker-compose/teuthology/Dockerfile --tag teuthology .
-```
-
-The compose Dockerfile is a starting point for the dispatcher container. It does not install the OpenShift/Kubernetes Python client. Prefer running `teuthology-lock` / reimage from a host that has `openshift.server` and `openshift.token` in teuthology.yaml, unless you extend the dispatcher image.
-
-Tag and push to a registry your cluster can pull from, then set the matching `*.image` values (or `--set`) before deploy.
-
-## Deploy
-
-Install the chart:
-
-```bash
-helm upgrade --install teuthology docs/openshift \
-  --namespace $NAMESPACE \
-  --create-namespace \
-  --history-max 3 \
-  -f docs/openshift/values.yaml
-```
-
-Wait for the UDN, core apps, dhcp-gateway, and teuthology CLI VM (VirtualMachinePool `replicas: 1`, `runStrategy: Always`):
-
-```bash
-oc get userdefinednetwork -n $NAMESPACE
-for d in paddles pulpito beanstalk archive dispatcher paddles-postgres; do
-  oc rollout status deploy/$d -n $NAMESPACE
-done
-oc get vmpool,vm,vmi -n $NAMESPACE -l 'app in (dhcp-gateway,teuthology)'
-oc wait -n $NAMESPACE --for=condition=Ready vm -l app=dhcp-gateway --timeout=20m
-oc wait -n $NAMESPACE --for=condition=Ready vm -l app=teuthology --timeout=20m
-# Optional: confirm DHCP service inside the gateway guest (after cloud-init finishes)
-ssh teuthology@$(oc get svc dhcp-gateway -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}') \
-  'systemctl is-active teuthology-udn-gateway dnsmasq'
-# CLI VM (password default: passwd). Bootstrap of /opt/teuthology may still be running.
-ssh teuthology@$(oc get svc teuthology -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-```
-
-No SCC grant is required. DHCP/DNS/NAT is configured by cloud-init inside the guest. First boot installs packages from the guest OS repositories.
-
-To render manifests without Helm install:
-
-```bash
-helm template teuthology docs/openshift \
-  -f docs/openshift/values.yaml | oc apply -n $NAMESPACE -f -
-```
-
-After Routes exist, set paddles’ log URL to the archive Route (required; the default placeholder is not usable) and upgrade:
-
-```bash
-ARCHIVE_HOST=$(oc get route archive -n $NAMESPACE -o jsonpath='{.spec.host}')
-helm upgrade teuthology docs/openshift \
-  --namespace $NAMESPACE \
-  --history-max 3 \
-  --set paddles.jobLogHrefTempl="http://${ARCHIVE_HOST}/{run_name}/{job_id}/teuthology.log" \
-  -f docs/openshift/values.yaml
-```
-
-If Routes use edge TLS, use `https://` in `jobLogHrefTempl` and in client `lock_server` / `results_*` URLs as appropriate.
-
-## Routes and external access
-
-The chart creates Routes for `paddles`, `pulpito`, and `archive` (no TLS by default — use **http://**). Print UI URLs:
-
-```bash
-echo "http://$(oc get route pulpito -n $NAMESPACE -o jsonpath='{.spec.host}')"
-echo "http://$(oc get route paddles -n $NAMESPACE -o jsonpath='{.spec.host}')"
-echo "http://$(oc get route archive -n $NAMESPACE -o jsonpath='{.spec.host}')"
-```
-
-Many namespaces ship a restrictive NetworkPolicy that only allows a specific ingresscontroller shard. The chart also creates `allow-openshift-ingress` so the default OpenShift router can reach app pods. Without that (or an equivalent policy), Routes return **503** even when pods are Ready.
 
 ## UserDefinedNetwork
 
-The chart creates a namespace-scoped `UserDefinedNetwork` (`udn.name`, default `teuthology-net`): Layer2 secondary overlay with IPAM disabled. OVN is a pure L2 pipe; addressing comes from the dhcp-gateway VM.
+The chart creates a namespace-scoped UserDefinedNetwork named `udn.name`. IPAM is disabled, so OVN only provides Layer2 connectivity. Addresses come from the dhcp-gateway VirtualMachine, not from OVN. OVN also creates a Multus NetworkAttachmentDefinition with the same name. The dhcp-gateway, the teuthology CLI VM, and lock guests attach to it as a secondary NIC using the `l2bridge` binding.
 
-OVN creates a Multus `NetworkAttachmentDefinition` with the same name. The dhcp-gateway VM attaches to it as a secondary NIC (`l2bridge`).
+Keep the UDN namespace-scoped so DHCP stays inside this project. The UDN spec is immutable. To change IPAM or the subnet, detach every consumer, delete the UDN, and create it again.
+
+| Key | Description |
+|-----|-------------|
+| `udn.name` | UDN and NAD name. `openshift.udn_name` must match. |
+| `udn.subnet` | Layer2 subnet, for example `192.168.0.0/20` |
+| `udn.gateway` | Static address on the dhcp-gateway UDN NIC. Do not assign this to the CLI VM or to targets. |
+| `udn.prefix` / `udn.netmask` | Must match `udn.subnet` |
+| `udn.dhcpRangeStart` / `udn.dhcpRangeEnd` | Dynamic pool for lock guests |
 
 ```bash
-oc get userdefinednetwork -n $NAMESPACE
-oc get network-attachment-definitions -n $NAMESPACE
+oc get userdefinednetwork,network-attachment-definitions -n "$NAMESPACE"
 ```
 
-Expect `NetworkCreated=True`. Spec is immutable; changing IPAM requires delete and recreate after detaching consumers.
+The UDN should report `NetworkCreated=True`. If `openshift.udn_name` is empty, guests stay on the masquerade network and do not register in UDN DNS.
 
 ## DHCP and gateway
 
-A `VirtualMachinePool` named `dhcp-gateway` keeps **replicas: 1**. The VM template uses `runStrategy: Always`, so if the VMI (or the VM object) is deleted, the pool recreates it. Cloud-init installs dnsmasq/nftables and enables `teuthology-udn-gateway.service`, which configures `udn.gateway`/`udn.prefix` on the UDN NIC, DHCP/DNS, and SNAT out masquerade — without a privileged pod.
+The dhcp-gateway is a VirtualMachinePool with `replicas: 1` and `runStrategy: Always`. It has two NICs: masquerade for the default route and egress, and the UDN NIC identified by `dhcpGateway.mac`. dnsmasq and nftables SNAT run inside the guest, so the pod does not need a privileged SCC. If the VM or VMI is deleted, the pool recreates it.
 
-Set `dhcpGateway.sshAuthorizedKeys` before deploy (optional; password login works with the defaults). SSH via the LoadBalancer Service:
+Service `dhcp-gateway` exposes SSH on port 22 through a LoadBalancer. Guest DNS is not on that Service. dnsmasq listens on the UDN NIC and uses `domain=<dispatcher.labDomain>`. Run only one DHCP and DNS server per namespace on this UDN.
 
-```bash
-oc get svc dhcp-gateway -n $NAMESPACE
-ssh teuthology@$(oc get svc dhcp-gateway -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-# default password: passwd
-```
+| Item | Rule |
+|------|------|
+| `dhcpGateway.dhcpHosts` | Infra only. Reserve `teuthology.mac`, `teuthology.ip`, and hostname `teuthology`. |
+| `target-*` | Do not add these names to `dhcpHosts`. They take addresses from the dynamic pool and send the paddles shortname as the DHCP hostname. |
+| `teuthology.ip` | Static lease just below the DHCP range. Do not use `udn.gateway`. |
+| Lock guests | Any free address in `dhcpRangeStart`–`dhcpRangeEnd`. DNS follows the current lease. |
+| Stale DNS | An old name can linger until the lease expires (12 hours) unless the guest releases DHCP on teardown. |
 
-Override credentials at deploy time:
-
-```bash
-helm upgrade --install teuthology docs/openshift \
-  --namespace $NAMESPACE \
-  --history-max 3 \
-  --set dhcpGateway.sshUser=teuthology \
-  --set dhcpGateway.password=mypassword \
-  -f docs/openshift/values.yaml
-```
-
-(Changing credentials on an already-provisioned disk requires recreating the VM disk or updating the guest user manually — cloud-init runs on first boot.)
-
-`dhcpGateway.dhcpHosts` is **only** for long-lived infra on the UDN (the teuthology CLI VM). It is not paddles inventory and must not list `target-*`. Lock/reimage creates a new guest, typically with a new MAC and a new address from the dynamic pool; Helm cannot pin that mapping.
+Cloud-init copies ConfigMap `dhcp-hosts` into the guest on first boot. After you change infra leases on a running gateway, edit `/etc/dnsmasq.d/dhcp-hosts.conf` and restart dnsmasq, or upgrade Helm and replace the VM disk so cloud-init runs again.
 
 ```yaml
 dhcpGateway:
@@ -327,155 +124,134 @@ dhcpGateway:
     dhcp-host=<teuthology.mac>,<teuthology.ip>,teuthology
 ```
 
-That file is also mirrored to ConfigMap `dhcp-hosts`. Cloud-init copies it into the gateway guest on **first boot**. After changing infra leases on a running guest, edit `/etc/dnsmasq.d/dhcp-hosts.conf` and `systemctl restart dnsmasq`, or helm upgrade and replace the VM disk so cloud-init runs again.
-
-Reserve the CLI VM just **below** the dynamic pool (`teuthology.ip`). Do not use `udn.gateway`. Target VMs take any free address in `udn.dhcpRangeStart`–`udn.dhcpRangeEnd`.
-
-**Dynamic DNS for lock guests:** dnsmasq on the gateway UDN NIC uses `domain=<labDomain>` (`dispatcher.labDomain`) and the DHCP pool. When a guest’s DHCP client sends hostname `target-00` (cloud-init / KubeVirt shortname), dnsmasq registers **`target-00.<lab_domain>` → current lease IP**. The next lock of the same paddles name may get a different IP; DNS follows the new lease. Stale names can linger until the old lease expires (12h in the gateway config) unless the guest releases DHCP on teardown.
-
-That DNS is namespace-specific; it is **not** CoreDNS and is **not** on Service `dhcp-gateway` (SSH :22 only). Run **one** DHCP/DNS server per namespace on this UDN.
-
-Workstations typically do **not** use this resolver. Run teuthology on the CLI VM instead. See [Teuthology CLI VM](#teuthology-cli-vm).
-
-## Register paddles nodes
-
-Store **FQDNs** in paddles. `teuthology-lock` looks up `canonicalize_hostname()`, which appends `lab_domain` (`target-00` → `target-00.<lab_domain>`). Short names (`target-00`) are the KubeVirt `VirtualMachine` name and the **DHCP hostname** the guest must send so dnsmasq can publish the FQDN. Do not pre-create `dhcp-host=` lines for these names.
-
-| Layer | Form | Example |
-|-------|------|---------|
-| paddles `nodes.name` | FQDN (`lab_domain`) | `target-00.<lab_domain>` |
-| paddles `mac_address` | UDN NIC MAC (required with UDN) | unique per node |
-| KubeVirt `VirtualMachine` | shortname | `target-00` |
-| DHCP client hostname | shortname (dynamic) | `target-00` |
-| SSH / DNS | FQDN → current lease | `target-00.<lab_domain>` |
-
-Paddles `mac_address` is **required** when `openshift.udn_name` is set: the provisioner copies it onto the UDN interface. It is **not** a Helm DHCP reservation — leave `target-*` out of `dhcpGateway.dhcpHosts` so the address still comes from the dynamic pool.
-
-Seed via SQL (set `PGPASSWORD` to match `postgres.password` in values). Use a unique MAC per node:
-
 ```bash
-oc exec -i -n $NAMESPACE deploy/paddles-postgres -- \
-  env PGPASSWORD=secret psql -U paddles -d paddles <<SQL
-insert into nodes (name, machine_type, is_vm, locked, up, mac_address) values
-('target-00.${LAB_DOMAIN}', '${MACHINE_TYPE}', true, false, false, '52:54:00:d4:ca:00'),
-('target-01.${LAB_DOMAIN}', '${MACHINE_TYPE}', true, false, false, '52:54:00:d4:ca:01'),
-('target-02.${LAB_DOMAIN}', '${MACHINE_TYPE}', true, false, false, '52:54:00:d4:ca:02'),
-('target-03.${LAB_DOMAIN}', '${MACHINE_TYPE}', true, false, false, '52:54:00:d4:ca:03');
-SQL
+oc get vmpool,vm,vmi,svc -n "$NAMESPACE" -l app=dhcp-gateway
+ssh teuthology@$(oc get svc dhcp-gateway -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}') \
+  'systemctl is-active teuthology-udn-gateway dnsmasq'
 ```
 
-If nodes were already seeded as short names, append `LAB_DOMAIN`:
+The default SSH user and password are `teuthology` / `passwd`. Run lock and SSH to `target-*.<lab_domain>` from the teuthology CLI VM, which is already on the UDN and uses this resolver.
 
-```bash
-oc exec -i -n $NAMESPACE deploy/paddles-postgres -- \
-  env PGPASSWORD=secret psql -U paddles -d paddles -c \
-  "UPDATE nodes SET name = name || '.${LAB_DOMAIN}'
-   WHERE machine_type='${MACHINE_TYPE}' AND name NOT LIKE '%.%';"
+## Configuration files
+
+| File | Purpose |
+|------|---------|
+| `docs/openshift/values.yaml` | Helm: images, UDN, infra VMs, and guest disk defaults |
+| teuthology.yaml (`openshift:`) | Provisioner: API auth, namespace, UDN, storage, and user-data path |
+| `teuthology/ocp/user_data/` | Cloud-init, extra disks, and SSH public keys |
+
+Edit `docs/openshift/values.yaml` before you deploy. Do not put paddles `target-*` inventory in that file or in `dhcpGateway.dhcpHosts`. Override any image with `--set *.image=...`. To build locally, use the paddles and pulpito Dockerfiles, `beanstalk/alpine`, or `docs/docker-compose/teuthology/Dockerfile`.
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `postgres.password` | Yes | Paddles database password |
+| `paddles.workerCount` | Yes | Keep `"4"` so gunicorn does not spawn too many workers |
+| `paddles.jobLogHrefTempl` | After first deploy | Archive Route URL |
+| `dispatcher.tube` | Yes | Must match paddles `machine_type` |
+| `dispatcher.labDomain` | Yes | Appended to short hostnames |
+| `*.storageClassName` | If the cluster has no default RWX class | archive PVC and dhcp-gateway / CLI VM disks |
+| `openshift.root_storage_class` | At lock | Guest operating-system disk |
+| `openshift.data_storage_class` | At lock | Extra disks from user-data `volumes:` |
+| `openshift.root_storage_size` / `vcpus` / `ram` | At lock | Guest size |
+| `teuthology.mac` / `teuthology.ip` | Yes | Must match `dhcpGateway.dhcpHosts` |
+| `teuthology.sshAuthorizedKeys` / `dhcpGateway.sshAuthorizedKeys` | Optional | Public keys for SSH into the **infra** VMs. Guest keys are not this list. |
+| `teuthology.dataSource` / `dhcpGateway.dataSource` | Yes | Fedora DataSource for the CLI and dhcp-gateway disks. Set `*.dataSource.namespace` if the DataSource is not in the chart namespace. |
+
+Helm writes `/etc/teuthology.yaml` on the CLI VM and on the dispatcher. Add `server` and `token` on the lock host after first boot. Cloud-init does not run again on a Helm upgrade unless you recreate the VM disk. A workstation copy belongs in `~/.teuthology.yaml`. Do not commit tokens.
+
+```yaml
+openshift:
+  namespace: <namespace>
+  machine_types: ['<machine_type>']
+  user_data: teuthology/ocp/user_data/ocp-{os_type}-{os_version}-user-data.txt
+  server: https://api.example.com:6443
+  token: <service-account-token>
+  certificate_authority_data: <base64-ca>   # if TLS verify needs a private CA
+  udn_name: <udn.name>                      # empty string disables the UDN NIC
+  udn_binding: l2bridge
+  datasource_namespace: <datasource-namespace>
+  vcpus: 4
+  ram: 8Gi
+  root_storage_size: 40Gi
+  root_storage_class: <rwx-storage-class>
+  data_storage_class: <rwx-storage-class>
 ```
 
-If those rows have no MAC, set unique addresses (UDN attach fails without `mac_address`):
+| Key | Required | Description |
+|-----|----------|-------------|
+| `server` | Yes | OpenShift API URL |
+| `token` | Yes | ServiceAccount bearer token |
+| `certificate_authority_data` | If TLS needs it | Base64 CA from the cluster kubeconfig |
+| `namespace` | Yes | Namespace for VMs and DataVolumes |
+| `machine_types` | Yes | Must match `dispatcher.tube` |
+| `user_data` | Yes | Path template for cloud-init files |
+| `udn_name` | For UDN guests | Multus network name. Empty disables the UDN NIC. |
+| `datasource_namespace` | If DataSources are not in `$NAMESPACE` | Namespace of cluster OS DataSources (often `openshift-virtualization-os-images`) |
+| `root_storage_class` | Yes | Guest operating-system disk |
+| `data_storage_class` | Yes | Extra disks listed under `volumes:` in user-data |
+
+Also set `lab_domain`, `lock_server`, `results_server`, and `queue_host` / `queue_port`. Use the beanstalk LoadBalancer EXTERNAL-IP from a workstation, or the in-cluster Service DNS from the CLI VM and dispatcher.
+
+## Names
+
+`teuthology-lock` looks up `canonicalize_hostname()`, which appends `lab_domain`. The KubeVirt object name and the DHCP hostname stay short. When `udn_name` is set, paddles `mac_address` is required so the provisioner can stamp that MAC on the UDN NIC. That MAC is not a Helm DHCP reservation.
+
+| Layer | Form |
+|-------|------|
+| paddles `nodes.name` | FQDN: `target-00.<lab_domain>` |
+| paddles `mac_address` | Unique per node when UDN is enabled |
+| KubeVirt VM and DHCP hostname | shortname: `target-00` |
+| SSH and DNS | `target-00.<lab_domain>` maps to the current dhcp-gateway lease |
+
+## Steps
+
+### 1. Deploy
+
+Install the chart, wait until the UDN and both VirtualMachines are Ready, then point paddles at the archive Route. The default `jobLogHrefTempl` is not usable until you do that.
 
 ```bash
-oc exec -i -n $NAMESPACE deploy/paddles-postgres -- \
-  env PGPASSWORD=secret psql -U paddles -d paddles -c \
-  "UPDATE nodes SET mac_address = '52:54:00:d4:ca:' || lpad(to_hex(id % 256), 2, '0')
-   WHERE machine_type='${MACHINE_TYPE}' AND (mac_address IS NULL OR mac_address = '');"
+helm upgrade --install teuthology docs/openshift \
+  --namespace "$NAMESPACE" --create-namespace --history-max 3 \
+  -f docs/openshift/values.yaml
+
+oc get userdefinednetwork -n "$NAMESPACE"
+for d in paddles pulpito beanstalk archive dispatcher paddles-postgres; do
+  oc rollout status deploy/$d -n "$NAMESPACE"
+done
+oc wait -n "$NAMESPACE" --for=condition=Ready vm -l app=dhcp-gateway --timeout=20m
+oc wait -n "$NAMESPACE" --for=condition=Ready vm -l app=teuthology --timeout=20m
 ```
 
-Prefer explicit MACs per node rather than deriving them from database ids.
-
-Or via the paddles API (use `https://` only if the Route has TLS):
+SSH as `teuthology` (default password `passwd`):
 
 ```bash
-PADDLES=$(oc get route paddles -n $NAMESPACE -o jsonpath='{.spec.host}')
-curl -X POST "http://${PADDLES}/nodes/" \
-  -H 'Content-Type: application/json' \
-  -d "{\"name\":\"target-00.${LAB_DOMAIN}\",\"machine_type\":\"${MACHINE_TYPE}\",\"is_vm\":true,\"up\":true,\"locked\":false,\"mac_address\":\"52:54:00:d4:ca:00\"}"
-curl -sf "http://${PADDLES}/nodes/target-00.${LAB_DOMAIN}/"
+ssh teuthology@$(oc get svc dhcp-gateway -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+ssh teuthology@$(oc get svc teuthology -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 ```
-
-`machine_type` must match `dispatcher.tube` and `openshift.machine_types`. `teuthology-lock --lock target-00` queries **`target-00.<lab_domain>`**.
-
-## Teuthology CLI VM
-
-This is a Fedora KubeVirt VM (`VirtualMachinePool` `teuthology`), not the `teuthology-dev` container image (that image is only for `deploy/dispatcher`).
-
-Dual NIC:
-
-* **masquerade** — default route, cluster DNS, `paddles` / `beanstalk` / git
-* **UDN** (`udn.name`, MAC `teuthology.mac`) — DHCP client; **static** lease `teuthology.ip` / hostname `teuthology` in `dhcpGateway.dhcpHosts` (infra only)
-
-Cloud-init writes `/etc/teuthology.yaml` (`lab_domain`, in-cluster paddles/beanstalk URLs), brings the UDN NIC up with DHCP, and points `*.<lab_domain>` at dhcp-gateway DNS. If `teuthology.install` is true, a oneshot clones `teuthology.gitUrl` into `/opt/teuthology` and runs `./bootstrap` (can take a long time; first boot dnf/git must reach the internet via masquerade).
-
-SSH (Service `teuthology`, LoadBalancer, default user/password `teuthology` / `passwd`):
 
 ```bash
-ssh teuthology@$(oc get svc teuthology -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-systemctl status teuthology-udn-client teuthology-bootstrap
-ip -4 addr show
-getent hosts paddles.$NAMESPACE.svc.cluster.local
-getent hosts teuthology.${LAB_DOMAIN}
-getent hosts target-00.${LAB_DOMAIN}
-# after bootstrap:
-export PATH="$PATH:/opt/teuthology/.venv/bin"
-teuthology-lock --list -t "$MACHINE_TYPE"
+ARCHIVE_HOST=$(oc get route archive -n "$NAMESPACE" -o jsonpath='{.spec.host}')
+helm upgrade teuthology docs/openshift \
+  --namespace "$NAMESPACE" --history-max 3 \
+  --set paddles.jobLogHrefTempl="http://${ARCHIVE_HOST}/{run_name}/{job_id}/teuthology.log" \
+  -f docs/openshift/values.yaml
 ```
-
-From this VM, `ubuntu@target-00.<lab_domain>` works after lock when that guest is on the UDN and registered its shortname with dhcp-gateway. The IP is whatever dnsmasq leased this time (`getent hosts`, not Helm). Guest login keys come from `teuthology/ocp/user_data/` (see [SSH keys](#ssh-keys-in-ocpuser_data)), not from copying into cloud-init at lock time.
-
-Changing the **CLI VM** MAC/IP requires a matching infra `dhcp-host=` line and a helm upgrade; recreate that VM disk if cloud-init already ran. Do not add `target-*` leases there.
-
-## Workstation access to test VMs
-
-This section applies when guests are **on the UDN** (Multus `udn.name` plus a DHCP hostname matching the paddles shortname). This chart only deploys the UDN, dhcp-gateway, and the teuthology CLI VM. The OpenShift provisioner attaches the UDN NIC, stamps the paddles MAC, and dual-DHCP (`eth0` masquerade + `eth1` UDN) via user-data. If `openshift.udn_name` is empty, guests stay masquerade-only and do not appear in dhcp-gateway DNS.
-
-After lock, teuthology SSHes as `ubuntu@<shortname>.<lab_domain>`. UDN guests get a **dynamic** address in the DHCP pool. That name/IP pair is not on the cluster pod network and is not stored in Helm.
-
-**Check from the lock host (the teuthology CLI VM):**
 
 ```bash
-getent hosts target-00.${LAB_DOMAIN}
-ping -c1 "$(getent hosts target-00.${LAB_DOMAIN} | awk '{print $1; exit}')"
-ssh -o ConnectTimeout=5 ubuntu@target-00.${LAB_DOMAIN}
+echo "http://$(oc get route pulpito -n "$NAMESPACE" -o jsonpath='{.spec.host}')"
+echo "http://$(oc get route paddles -n "$NAMESPACE" -o jsonpath='{.spec.host}')"
 ```
 
-If the name does not resolve, the guest did not DHCP on the UDN with hostname `target-00`, or the old lease is still held. If the name resolves but SSH times out, you have no route into the UDN subnet (run this on the CLI VM, not a laptop).
+Use `https://` only when the Routes terminate TLS. A Route that returns **503** while pods are Ready usually means the router cannot reach the pods; the chart NetworkPolicy `allow-openshift-ingress` is meant to fix that.
 
-**Option A — split DNS (only if the lock host can already route to the UDN):** forward only `<lab_domain>` to `udn.gateway` from `values.yaml`. Hosts on the cluster/pod network usually cannot reach that address. Example check:
+### 2. ServiceAccount token
 
-```bash
-dig @<udn.gateway> target-00.${LAB_DOMAIN}
-```
-
-Do not put `target-*` into `dhcpGateway.dhcpHosts` or `/etc/hosts`. Those IPs change at lock.
-
-**Option B (preferred) — teuthology CLI VM:** SSH to Service `teuthology` and run lock/reimage there. That guest is on the UDN, uses dhcp-gateway DNS, and does not need workstation routes. See [Teuthology CLI VM](#teuthology-cli-vm).
-
-Do not invent a second DNS service for the namespace: guests already use dhcp-gateway dnsmasq. Optional later work is exposing UDP/TCP 53 on Service `dhcp-gateway` for workstations; SSH from a laptop to UDN guests still needs a route into the UDN.
-
-## OpenShift Virtualization
-
-This chart does not create test VMs. Lock/reimage uses the OpenShift provisioner. Prefer running it **on the teuthology CLI VM** (already has `lab_domain` and paddles URLs). The provisioner authenticates with a ServiceAccount **token** (and an optional CA) from teuthology.yaml, not a personal `oc login`. The `teuthology-dev` extra is for containers/workstations, not this Fedora guest:
-
-```bash
-# on the teuthology VM, after bootstrap:
-cd /opt/teuthology && pip install -e '.[openshift]'
-```
-
-### Service account for the OpenShift provisioner
-
-Create a namespace-scoped ServiceAccount that can manage VirtualMachines (and related objects) in `$NAMESPACE`. Bind the built-in `admin` role in that namespace so the client can create and delete VMs, DataVolumes, and secrets used by cloud-init.
+Create a ServiceAccount in the namespace with permission to manage VirtualMachines, DataVolumes, and Secrets. Bind the built-in `admin` role in that namespace. Kubernetes 1.24 and later do not mint a long-lived token unless you create a token Secret.
 
 ```bash
 oc create serviceaccount "$SA" -n "$NAMESPACE"
+oc adm policy add-role-to-user admin -z "$SA" -n "$NAMESPACE"
 
-oc adm policy add-role-to-user admin \
-  -z "$SA" -n "$NAMESPACE"
-```
-
-Kubernetes 1.24+ does not create a long-lived token Secret automatically. Request one:
-
-```bash
 oc apply -n "$NAMESPACE" -f - <<EOF
 apiVersion: v1
 kind: Secret
@@ -486,259 +262,82 @@ metadata:
 type: kubernetes.io/service-account-token
 EOF
 
-until TOKEN_B64=$(oc get secret "${SA}-token" -n "$NAMESPACE" -o jsonpath='{.data.token}') && [[ -n "$TOKEN_B64" ]]; do
-  sleep 1
-done
-```
-
-Extract the API server URL and bearer token:
-
-```bash
-SERVER=$(oc config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+SERVER=$(oc whoami --show-server)
 TOKEN=$(oc get secret "${SA}-token" -n "$NAMESPACE" -o jsonpath='{.data.token}' | base64 -d)
-```
-
-Add `certificate_authority_data` only if the API server uses a CA that is **not** in the lock host’s system trust store (typical for a private cluster CA). Skip it when the API cert is publicly trusted.
-
-```bash
 CA_DATA=$(oc config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
 ```
 
-Verify:
+Put `server` and `token` under `openshift:` in teuthology.yaml. Add `certificate_authority_data` only when the lock host does not trust the API server CA. On the CLI VM the file is `/etc/teuthology.yaml`.
 
 ```bash
 oc login --token="$TOKEN" --server="$SERVER"
-# if TLS fails, pass the CA:  --certificate-authority=<(printf '%s' "$CA_DATA" | base64 -d)
 oc whoami
 # system:serviceaccount:<namespace>:<sa>
 ```
 
-Put `server` and `token` (and `certificate_authority_data` only when required) under `openshift:` in teuthology.yaml on the lock host. Do not commit them.
+Do not commit tokens. To rotate, delete and recreate Secret `${SA}-token` and replace `openshift.token`.
 
-```yaml
-openshift:
-  server: "<api-server>"     # $SERVER
-  token: "<sa-bearer-token>" # $TOKEN
-  # certificate_authority_data: "<base64-ca>"  # $CA_DATA, only if TLS verify needs it
-```
+### 3. SSH keys and extra disks
 
-On the teuthology CLI VM, merge those keys into `/etc/teuthology.yaml` (Helm writes the rest of the `openshift:` block at first boot). Cloud-init does not re-run on later helm upgrades unless you recreate the VM disk.
+There are two separate key lists. Do not mix them.
 
-```bash
-TEUTH_IP=$(oc get svc teuthology -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-ssh teuthology@"$TEUTH_IP"
-# edit /etc/teuthology.yaml — add server, token, and certificate_authority_data if needed
-```
+Helm `teuthology.sshAuthorizedKeys` and `dhcpGateway.sshAuthorizedKeys` grant SSH into those infra VirtualMachines. They do not go onto test guests. Password login still works with the chart defaults (`teuthology` / `passwd`).
 
-If DataSources live in another namespace (`openshift.datasource_namespace`), namespace `admin` on `$NAMESPACE` is still enough for VM create; the cluster CDI/virt controllers read those DataSources. Grant extra RBAC only if lock fails with a forbidden error on that namespace.
+Guest login keys live in `teuthology/ocp/user_data/ocp-{os_type}-{os_version}-user-data.txt` under `ssh_authorized_keys`. The provisioner does not copy keys from the locker’s `~/.ssh` at lock time. The shipped templates log in as `ubuntu`. Extra disks use a teuthology-only `volumes:` list that is stripped before cloud-init.
 
-To rotate, delete Secret `${SA}-token`, recreate it, and replace `openshift.token`. To revoke: `oc delete serviceaccount "$SA" -n "$NAMESPACE"`.
-
-Helm writes the `openshift:` block into `/etc/teuthology.yaml` on the CLI VM and dispatcher. For a workstation, configure `~/.teuthology.yaml` (see also `docs/siteconfig.rst`):
-
-```yaml
-lock_server: http://paddles.<route-host>/
-results_server: http://paddles.<route-host>/
-results_ui_server: http://pulpito.<route-host>/
-queue_host: <beanstalk-reachable-address>
-queue_port: 11300
-lab_domain: <lab_domain>
-archive_base: /path/to/local-or-mounted-archive
-ssh_key: ~/.ssh/id_ed25519   # private key matching pubkeys in ocp/user_data
-
-openshift:
-  namespace: <namespace>           # same as $NAMESPACE
-  machine_types: ['<machine_type>']  # match paddles machine_type and dispatcher.tube
-  user_data: teuthology/ocp/user_data/ocp-{os_type}-{os_version}-user-data.txt
-  server: https://api.example.com:6443
-  token: <service-account-token>
-  # certificate_authority_data: <base64-ca>  # only if TLS verify needs a private CA
-  udn_name: <udn.name>             # empty string = masquerade only, no UDN NIC
-  udn_binding: l2bridge
-  datasource_namespace: <datasource-namespace>
-  vcpus: 4
-  ram: 8Gi
-  root_storage_size: 40Gi
-  root_storage_class: <rwx-storage-class>   # required: guest OS disk
-  data_storage_class: <rwx-storage-class>   # required: extra disks from user-data volumes
-```
-
-`lab_domain` must match `dispatcher.labDomain`. Replace `<route-host>` with hosts from `oc get routes -n $NAMESPACE`. `vcpus`, `ram`, `root_storage_size`, `root_storage_class`, and `data_storage_class` are required at lock time.
-
-### Guest storage classes
-
-Helm `archive.storageClassName` / `dhcpGateway.storageClassName` / `teuthology.storageClassName` apply only to **infra** PVCs and the CLI / dhcp-gateway VM disks.
-
-Lock/reimage guests use a different pair:
-
-| Disk | Source | Config |
-|------|--------|--------|
-| Root (OS) | OpenShift Virtualization DataSource | `openshift.root_storage_size` + `openshift.root_storage_class` |
-| Extra (OSD-style) | `volumes:` in the OS user-data file | `openshift.data_storage_class` |
-
-The two classes may be the same RWX class, or different (for example a faster class for root and a denser class for data). Uncomment them in `docs/openshift/values.yaml` so the CLI VM and dispatcher pick them up.
-
-### SSH keys in `ocp/user_data`
-
-Authorized keys are **baked into** `teuthology/ocp/user_data/ocp-{os_type}-{os_version}-user-data.txt`. The provisioner does not copy keys from the locker’s `~/.ssh` at runtime.
-
-Edit both templates (Ubuntu and CentOS Stream) under `ssh_authorized_keys`:
-
-```yaml
-users:
-  - name: ubuntu
-    groups: sudo          # wheel on CentOS Stream
-    shell: /bin/bash
-    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
-    ssh_authorized_keys:
-      - ssh-ed25519 AAAA... teuthology@teuthology
-```
-
-Put the **public** half of the key the lock host uses (`ssh_key` / `~/.ssh/id_ed25519` on the CLI VM). After first boot on the CLI VM:
+On the CLI VM after bootstrap, create a key if needed, then paste the **public** half into both user-data files (not into Helm `sshAuthorizedKeys` unless you also want that key on the CLI VM itself):
 
 ```bash
-# on the teuthology VM
 test -f ~/.ssh/id_ed25519 || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519
 cat ~/.ssh/id_ed25519.pub
-# paste into teuthology/ocp/user_data/*.txt in the clone, then lock/reimage
+cd /opt/teuthology && pip install -e '.[openshift]'
 ```
 
-Login user in the shipped templates is `ubuntu` for both Ubuntu and CentOS Stream.
+### 4. Paddles nodes
 
-The same files may list extra blank disks. That `volumes:` key is teuthology-only (stripped before cloud-init), same role as OpenStack volumes:
-
-```yaml
-volumes:
-  - count: 3
-    size: 15  # Gi
-  - count: 2
-    size: 20  # Gi
-```
-
-User-data also enables DHCP on `eth0` (masquerade) and `eth1` (UDN).
-
-### Lock / reimage
-
-Beanstalk defaults to `serviceType: LoadBalancer` so workstations can use the EXTERNAL-IP as `queue_host`. Override with `beanstalk.serviceType=ClusterIP` for in-cluster-only access.
+Register FQDNs and a unique MAC per node. `machine_type` must match `dispatcher.tube` and `openshift.machine_types`. Set `PGPASSWORD` to `postgres.password`.
 
 ```bash
-oc get svc beanstalk -n $NAMESPACE
-# EXTERNAL-IP → queue_host in ~/.teuthology.yaml (port 11300)
+oc exec -i -n "$NAMESPACE" deploy/paddles-postgres -- \
+  env PGPASSWORD=secret psql -U paddles -d paddles <<SQL
+insert into nodes (name, machine_type, is_vm, locked, up, mac_address) values
+('target-00.${LAB_DOMAIN}', '${MACHINE_TYPE}', true, false, false, '52:54:00:d4:ca:00'),
+('target-01.${LAB_DOMAIN}', '${MACHINE_TYPE}', true, false, false, '52:54:00:d4:ca:01');
+SQL
 ```
 
-In-cluster processes can use `beanstalk` or `beanstalk.$NAMESPACE.svc.cluster.local`.
+```bash
+PADDLES=$(oc get route paddles -n "$NAMESPACE" -o jsonpath='{.spec.host}')
+curl -X POST "http://${PADDLES}/nodes/" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"target-00.${LAB_DOMAIN}\",\"machine_type\":\"${MACHINE_TYPE}\",\"is_vm\":true,\"up\":true,\"locked\":false,\"mac_address\":\"52:54:00:d4:ca:00\"}"
+```
 
-After paddles nodes (FQDNs **and MACs**) are in place:
+### 5. Lock and reimage
+
+Confirm the cluster has a DataSource for the guest OS before you lock. Infra VMs (dhcp-gateway and the CLI) use the Fedora DataSource in `values.yaml` (`teuthology.dataSource`, `dhcpGateway.dataSource`). Lock and reimage clone a **different** DataSource from `os-type` and `os-version` (for example Ubuntu 22.04). Set `openshift.datasource_namespace` when those objects live outside `$NAMESPACE`.
 
 ```bash
-# teuthology-lock looks up target-00.<lab_domain>
+oc get datasource -n "${DATASOURCE_NAMESPACE:-openshift-virtualization-os-images}"
+```
+
+On the CLI VM, add `/opt/teuthology/.venv/bin` to `PATH`. The provisioner creates a VirtualMachine named with the paddles shortname, attaches the UDN with the paddles MAC, clones that OS DataSource onto the root disk (`root_storage_class`), and adds extra DataVolumes from user-data (`data_storage_class`). Unlock and reimage delete that VM.
+
+```bash
 teuthology-lock --lock target-00 --machine-type "$MACHINE_TYPE" --os-type ubuntu --os-version 22.04
-# or:
-teuthology-lock --lock-many 1 -m "$MACHINE_TYPE" --os-type ubuntu --os-version 22.04
+getent hosts "target-00.${LAB_DOMAIN}"
+ssh ubuntu@"target-00.${LAB_DOMAIN}"
 ```
 
-The provisioner creates a `VirtualMachine` named **shortname** in `$NAMESPACE`, attaches `udn_name` with the paddles MAC, clones the OS DataSource onto the root PVC (`root_storage_class`), and adds extra DataVolumes (`data_storage_class`) from user-data `volumes:`. Cloud-init comes from `teuthology/ocp/user_data/`. On unlock/reimage teardown it deletes the VM.
-
-**Networking:** do not expect a Helm `dhcp-host` for that name. The guest DHCPs on the UDN and must send hostname **shortname** so `shortname.<lab_domain>` resolves on the CLI VM. Set `udn_name: ""` only if you want masquerade/pod IPs and no `*.<lab_domain>` record.
-
-## Verify
-
-Wait for core workloads:
-
-```bash
-oc get userdefinednetwork -n $NAMESPACE
-oc get vmpool,vm,vmi -n $NAMESPACE -l app=dhcp-gateway
-oc get all -n $NAMESPACE
-```
-
-Check PostgreSQL:
-
-```bash
-oc exec -n $NAMESPACE deploy/paddles-postgres -- pg_isready -U paddles -d paddles
-```
-
-Check paddles:
-
-```bash
-oc exec -n $NAMESPACE deploy/paddles -- curl -sf http://localhost:8080
-```
-
-Check pulpito:
-
-```bash
-oc exec -n $NAMESPACE deploy/pulpito -- curl -sf http://localhost:8081
-echo "http://$(oc get route pulpito -n $NAMESPACE -o jsonpath='{.spec.host}')"
-```
-
-Check beanstalk:
-
-```bash
-oc get svc beanstalk -n $NAMESPACE
-```
-
-Check archive:
-
-```bash
-oc exec -n $NAMESPACE deploy/archive -- curl -sf http://localhost:8080/
-```
-
-Check dispatcher:
-
-```bash
-oc logs -n $NAMESPACE deploy/dispatcher --tail=50
-```
-
-Check the teuthology CLI VM:
-
-```bash
-oc get vmpool,vm,vmi,svc -n $NAMESPACE -l app=teuthology
-oc wait -n $NAMESPACE --for=condition=Ready vm -l app=teuthology --timeout=20m
-ssh teuthology@$(oc get svc teuthology -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}') \
-  'systemctl is-active teuthology-udn-client; getent hosts paddles.'"$NAMESPACE"'.svc.cluster.local'
-```
-
-Check UDN / DHCP / routes:
-
-```bash
-oc get userdefinednetwork,network-attachment-definitions -n $NAMESPACE
-oc get vmpool,vm,vmi,svc -n $NAMESPACE -l 'app in (dhcp-gateway,teuthology)'
-oc get routes -n $NAMESPACE
-```
-
-After a successful lock (from the teuthology CLI VM):
-
-```bash
-oc get vm,vmi -n $NAMESPACE
-getent hosts target-00.${LAB_DOMAIN}   # IP is the current DHCP lease, not Helm
-```
-
-## Notes
-
-* Prefer managing postgres credentials outside git for production.
-* Do not reuse a PostgreSQL PVC across major image version changes (e.g. Docker Hub `postgres` vs `teuthology-postgresql` PG14); wipe or migrate the PVC if the server fails on `postgresql.conf`.
-* `paddles.workerCount` defaults to `"4"`; without it, gunicorn may spawn hundreds of workers on large nodes and stop serving HTTP.
-* Routes omit `spec.host` so OpenShift assigns hostnames; set `spec.host` in templates if you need fixed DNS.
-* Routes are plain HTTP unless you add `spec.tls`; prefer `http://` URLs (https without TLS termination yields router 503).
-* NetworkPolicy `allow-openshift-ingress` lets the OpenShift router reach Services when a tenant policy would otherwise block it.
-* Archive and **infra** VM disks default to `ReadWriteMany`; set Helm `*.storageClassName` to `<rwx-storage-class>` when the cluster requires an explicit RWX class. Guest OS vs extra disks use `openshift.root_storage_class` and `openshift.data_storage_class` (required by the provisioner).
-* DHCP/NAT/DNS runs in a dual-NIC gateway VM (`VirtualMachinePool` replicas=1); no privileged SCC. DHCP and guest DNS are limited to this namespace’s UDN L2 domain.
-* `*.<lab_domain>` for **targets** is dynamic DHCP DNS on the dhcp-gateway UDN NIC, not CoreDNS and not `dhcpGateway.dhcpHosts`. Run lock/SSH from the teuthology CLI VM.
-* `dhcpGateway.dhcpHosts` is infra-only (teuthology CLI VM). Do not add `target-*`; guest IPs stay in the dynamic pool. Paddles `mac_address` is reused on the UDN NIC but is not a dnsmasq reservation.
-* `teuthology-dev` is a container image (dispatcher only). The CLI host is a Fedora KubeVirt VM on the UDN.
-* Paddles node names must be FQDNs (`target-00.<lab_domain>`); KubeVirt VM names and DHCP hostnames stay short. With UDN, each node needs a unique `mac_address`.
-* Guest SSH keys live in `teuthology/ocp/user_data/`; they are not taken from the locker’s `~/.ssh` at lock time.
-* The OpenShift provisioner uses `openshift.server` and `openshift.token` (optional `certificate_authority_data`). Create a ServiceAccount token; do not use a personal `oc login`.
-* This chart does not create test VMs. The OpenShift provisioner attaches `udn.name` unless `openshift.udn_name` is empty.
-* Use namespace-scoped `UserDefinedNetwork`, not a cluster-wide UDN, so DHCP stays in the project.
-* Helm keeps `--history-max 3` release Secrets; pass the same flag on every upgrade.
+The guest obtains an address with DHCP on the UDN. DNS for that name is dhcp-gateway dnsmasq, not CoreDNS.
 
 ## Uninstall
 
+Detach remaining VMs from the UDN, then uninstall the release. Helm leaves PVCs in place unless you delete them.
+
 ```bash
-# Detach VMs from the UDN first if any remain, then:
-helm uninstall teuthology -n $NAMESPACE
-oc delete userdefinednetwork "$UDN_NAME" -n $NAMESPACE --ignore-not-found
-# PVCs (postgres, archive, dhcp-gateway disk) are retained unless you delete them:
-oc delete pvc -l app=dhcp-gateway -n $NAMESPACE --ignore-not-found
-oc delete pvc paddles-postgres-data teuthology-archive -n $NAMESPACE --ignore-not-found
+helm uninstall teuthology -n "$NAMESPACE"
+oc delete userdefinednetwork "$UDN_NAME" -n "$NAMESPACE" --ignore-not-found
+oc delete pvc -l app=dhcp-gateway -n "$NAMESPACE" --ignore-not-found
+oc delete pvc paddles-postgres-data teuthology-archive -n "$NAMESPACE" --ignore-not-found
 ```
